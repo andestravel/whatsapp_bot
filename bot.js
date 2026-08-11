@@ -9,9 +9,11 @@ import {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import QRCode from "qrcode";
+import { extractLidPhoneMapping, resolveMessageJid, resolveSenderJid } from "./jid.js";
 
 // -----------------------------------------------------------------------------
 // Configuración
@@ -19,20 +21,12 @@ import QRCode from "qrcode";
 
 const PORT = Number(process.env.PORT || 3000);
 const API_TOKEN = (process.env.API_TOKEN || "").trim();
-const DATABASE_PATH = path.resolve(
-  process.env.DATABASE_PATH || "./data/whatsapp.sqlite",
-);
+const DATABASE_PATH = path.resolve(process.env.DATABASE_PATH || "./data/whatsapp.sqlite");
 const BACKUP_DIR = path.resolve(
   process.env.BACKUP_DIR || path.join(path.dirname(DATABASE_PATH), "backups"),
 );
-const BACKUP_INTERVAL_HOURS = readPositiveInteger(
-  process.env.BACKUP_INTERVAL_HOURS,
-  24,
-);
-const BACKUP_RETENTION_COUNT = readPositiveInteger(
-  process.env.BACKUP_RETENTION_COUNT,
-  3,
-);
+const BACKUP_INTERVAL_HOURS = readPositiveInteger(process.env.BACKUP_INTERVAL_HOURS, 24);
+const BACKUP_RETENTION_COUNT = readPositiveInteger(process.env.BACKUP_RETENTION_COUNT, 3);
 
 // Si se configura, cada mensaje entrante se reenvía al proyecto web.
 // El bot sigue funcionando aunque no exista webhook todavía.
@@ -45,9 +39,7 @@ if (!API_TOKEN) {
 }
 
 if (INCOMING_WEBHOOK_URL && !INCOMING_WEBHOOK_TOKEN) {
-  console.error(
-    "INCOMING_WEBHOOK_URL está configurado, pero falta INCOMING_WEBHOOK_TOKEN.",
-  );
+  console.error("INCOMING_WEBHOOK_URL está configurado, pero falta INCOMING_WEBHOOK_TOKEN.");
   process.exit(1);
 }
 
@@ -100,6 +92,15 @@ database.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
     ON conversations (updated_at DESC);
+
+  CREATE TABLE IF NOT EXISTS jid_aliases (
+    alias_jid TEXT PRIMARY KEY,
+    canonical_jid TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_jid_aliases_canonical
+    ON jid_aliases (canonical_jid);
 `);
 
 // Estas migraciones pequeñas permiten actualizar una base creada por una versión
@@ -131,12 +132,127 @@ function phoneFromJid(jid) {
   return number || null;
 }
 
+function rememberJidAlias(aliasJid, canonicalJid) {
+  database
+    .prepare(
+      `
+      INSERT INTO jid_aliases (alias_jid, canonical_jid, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(alias_jid) DO UPDATE SET
+        canonical_jid = excluded.canonical_jid,
+        updated_at = excluded.updated_at
+    `,
+    )
+    .run(aliasJid, canonicalJid, isoNow());
+}
+
+function canonicalJidForAlias(jid) {
+  return (
+    database.prepare("SELECT canonical_jid FROM jid_aliases WHERE alias_jid = ?").get(jid)
+      ?.canonical_jid || jid
+  );
+}
+
+function migrateConversationJid(aliasJid, canonicalJid) {
+  if (
+    !aliasJid?.endsWith("@lid") ||
+    !canonicalJid?.endsWith("@s.whatsapp.net") ||
+    aliasJid === canonicalJid
+  ) {
+    return false;
+  }
+
+  const source = database.prepare("SELECT * FROM conversations WHERE jid = ?").get(aliasJid);
+  if (!source) {
+    rememberJidAlias(aliasJid, canonicalJid);
+    return false;
+  }
+
+  const target = database.prepare("SELECT * FROM conversations WHERE jid = ?").get(canonicalJid);
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    if (target) {
+      const sourceIsNewer =
+        !target.last_message_at ||
+        (source.last_message_at && source.last_message_at > target.last_message_at);
+      database
+        .prepare(
+          `
+          UPDATE conversations
+          SET phone = ?,
+              contact_name = ?,
+              last_message_preview = ?,
+              last_message_at = ?,
+              updated_at = ?
+          WHERE jid = ?
+        `,
+        )
+        .run(
+          phoneFromJid(canonicalJid),
+          target.contact_name || source.contact_name || null,
+          sourceIsNewer ? source.last_message_preview : target.last_message_preview,
+          sourceIsNewer ? source.last_message_at : target.last_message_at,
+          isoNow(),
+          canonicalJid,
+        );
+    } else {
+      database
+        .prepare(
+          `
+          INSERT INTO conversations (
+            jid, phone, contact_name, is_group, last_message_preview,
+            last_message_at, created_at, updated_at
+          )
+          VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+        `,
+        )
+        .run(
+          canonicalJid,
+          phoneFromJid(canonicalJid),
+          source.contact_name || null,
+          source.last_message_preview || null,
+          source.last_message_at || null,
+          source.created_at || isoNow(),
+          isoNow(),
+        );
+    }
+
+    database.prepare("UPDATE messages SET jid = ? WHERE jid = ?").run(canonicalJid, aliasJid);
+    rememberJidAlias(aliasJid, canonicalJid);
+    database.prepare("DELETE FROM conversations WHERE jid = ?").run(aliasJid);
+    database.exec("COMMIT");
+    return true;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function applyLidPhoneMapping(value) {
+  const mapping = extractLidPhoneMapping(value);
+  if (!mapping) return false;
+  migrateConversationJid(mapping.lid, mapping.pn);
+  return true;
+}
+
+function applyLidPhoneMappings(values) {
+  for (const value of values || []) applyLidPhoneMapping(value);
+}
+
+function aliasesForJid(jid) {
+  return database
+    .prepare("SELECT alias_jid FROM jid_aliases WHERE canonical_jid = ?")
+    .all(jid)
+    .map((row) => row.alias_jid);
+}
+
 function upsertConversation({ jid, contactName, messageType, messageText, messageAt }) {
   const now = isoNow();
   const preview = messageText ? messageText.slice(0, 300) : `[${messageType}]`;
 
   database
-    .prepare(`
+    .prepare(
+      `
       INSERT INTO conversations (
         jid,
         phone,
@@ -154,7 +270,8 @@ function upsertConversation({ jid, contactName, messageType, messageText, messag
         last_message_preview = excluded.last_message_preview,
         last_message_at = excluded.last_message_at,
         updated_at = excluded.updated_at
-    `)
+    `,
+    )
     .run(
       jid,
       phoneFromJid(jid),
@@ -189,7 +306,8 @@ function saveMessage({
   });
 
   const result = database
-    .prepare(`
+    .prepare(
+      `
       INSERT OR IGNORE INTO messages (
         whatsapp_message_id,
         jid,
@@ -205,7 +323,8 @@ function saveMessage({
         created_at
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
+    `,
+    )
     .run(
       whatsappMessageId,
       jid,
@@ -274,10 +393,7 @@ function scheduleDatabaseBackups() {
   const initialBackup = setTimeout(createDatabaseBackup, 5000);
   initialBackup.unref();
 
-  const interval = setInterval(
-    createDatabaseBackup,
-    BACKUP_INTERVAL_HOURS * 60 * 60 * 1000,
-  );
+  const interval = setInterval(createDatabaseBackup, BACKUP_INTERVAL_HOURS * 60 * 60 * 1000);
   interval.unref();
 }
 
@@ -436,11 +552,33 @@ async function connectToWhatsApp() {
     version,
     logger,
     printQRInTerminal: true,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
     generateHighQualityLinkPreview: true,
   });
 
   sock.ev.on("creds.update", saveCreds);
+
+  // WhatsApp puede entregar la relación LID ↔ teléfono en distintos eventos.
+  // La guardamos apenas aparece, incluso antes de que llegue el primer mensaje.
+  sock.ev.on("lid-mapping.update", (mapping) => {
+    applyLidPhoneMapping(mapping);
+  });
+
+  sock.ev.on("contacts.upsert", (contacts) => {
+    applyLidPhoneMappings(contacts);
+  });
+
+  sock.ev.on("contacts.update", (contacts) => {
+    applyLidPhoneMappings(contacts);
+  });
+
+  sock.ev.on("messaging-history.set", ({ contacts, lidPnMappings }) => {
+    applyLidPhoneMappings(lidPnMappings);
+    applyLidPhoneMappings(contacts);
+  });
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -488,19 +626,21 @@ async function connectToWhatsApp() {
 
     for (const message of event.messages || []) {
       try {
-        const jid = message?.key?.remoteJid || "";
-        const senderJid = message?.key?.participant || jid;
+        const rawJid = message?.key?.remoteJid || "";
 
         // No procesar mensajes propios ni mensajes de estado de WhatsApp.
-        if (!jid || message.key?.fromMe || jid === "status@broadcast") continue;
+        if (!rawJid || message.key?.fromMe || rawJid === "status@broadcast") continue;
 
-        const {
-          messageType,
-          messageText,
-          mediaMimeType,
-          mediaFileName,
-          mediaSizeBytes,
-        } = extractMessageData(message);
+        const resolvedJid = await resolveMessageJid(
+          message.key,
+          sock?.signalRepository?.lidMapping,
+        );
+        const jid = canonicalJidForAlias(resolvedJid);
+        const senderJid = resolveSenderJid(message.key, jid);
+        if (rawJid !== jid) migrateConversationJid(rawJid, jid);
+
+        const { messageType, messageText, mediaMimeType, mediaFileName, mediaSizeBytes } =
+          extractMessageData(message);
         const messageAt = messageTimestampToIso(message.messageTimestamp);
         const whatsappMessageId = message.key?.id || `incoming-${randomUUID()}`;
 
@@ -599,18 +739,58 @@ app.get("/status", authMiddleware, (req, res) => {
 });
 
 // Lista de conversaciones para que la web pueda construir una bandeja de entrada.
-app.get("/conversations", authMiddleware, (req, res) => {
+app.get("/conversations", authMiddleware, async (req, res) => {
   const limit = parseLimit(req.query.limit);
-  const conversations = database
-    .prepare(`
+  const initialConversations = database
+    .prepare(
+      `
       SELECT *
       FROM conversations
       ORDER BY updated_at DESC
       LIMIT ?
-    `)
+    `,
+    )
     .all(limit);
 
+  for (const conversation of initialConversations) {
+    if (!conversation.jid.endsWith("@lid")) continue;
+    const resolvedJid = await resolveMessageJid(
+      { remoteJid: conversation.jid },
+      sock?.signalRepository?.lidMapping,
+    );
+    if (resolvedJid !== conversation.jid) {
+      migrateConversationJid(conversation.jid, resolvedJid);
+    }
+  }
+
+  const conversations = database
+    .prepare(
+      `
+      SELECT *
+      FROM conversations
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `,
+    )
+    .all(limit)
+    .map((conversation) => ({
+      ...conversation,
+      alias_jids: aliasesForJid(conversation.jid),
+    }));
+
   res.json({ conversations });
+});
+
+// Vinculación manual para LID históricos que WhatsApp no puede resolver.
+app.post("/conversations/link", authMiddleware, (req, res) => {
+  const aliasJid = String(req.body?.aliasJid || "").trim();
+  const canonicalJid = normalizeJid(req.body?.phone);
+  if (!aliasJid.endsWith("@lid") || !canonicalJid.endsWith("@s.whatsapp.net")) {
+    return res.status(400).json({ error: "Alias o teléfono inválido" });
+  }
+
+  migrateConversationJid(aliasJid, canonicalJid);
+  return res.json({ success: true, jid: canonicalJid });
 });
 
 // Historial de una conversación. El JID debe enviarse URL-encoded.
@@ -619,13 +799,15 @@ app.get("/conversations/:jid/messages", authMiddleware, (req, res) => {
   const limit = parseLimit(req.query.limit);
 
   const messages = database
-    .prepare(`
+    .prepare(
+      `
       SELECT *
       FROM messages
       WHERE jid = ?
       ORDER BY message_at DESC
       LIMIT ?
-    `)
+    `,
+    )
     .all(jid, limit)
     .reverse();
 
@@ -645,14 +827,22 @@ app.post("/send", authMiddleware, async (req, res) => {
 
     if (action === "send-text") {
       const text = message || "";
-      await sendAndStore(jid, { text }, { messageType: "conversation", messageText: text });
-      return res.json({ success: true, message: "Texto enviado" });
+      const sentMessage = await sendAndStore(
+        jid,
+        { text },
+        { messageType: "conversation", messageText: text },
+      );
+      return res.json({
+        success: true,
+        message: "Texto enviado",
+        whatsappMessageId: sentMessage?.key?.id || null,
+      });
     }
 
     if (action === "send-image") {
       if (!url) return res.status(400).json({ error: "Falta url" });
 
-      await sendAndStore(
+      const sentMessage = await sendAndStore(
         jid,
         { image: { url }, caption: caption || "" },
         {
@@ -661,13 +851,17 @@ app.post("/send", authMiddleware, async (req, res) => {
           mediaMimeType: "image/remote",
         },
       );
-      return res.json({ success: true, message: "Imagen enviada" });
+      return res.json({
+        success: true,
+        message: "Imagen enviada",
+        whatsappMessageId: sentMessage?.key?.id || null,
+      });
     }
 
     if (action === "send-file") {
       if (!url) return res.status(400).json({ error: "Falta url" });
 
-      await sendAndStore(
+      const sentMessage = await sendAndStore(
         jid,
         {
           document: { url },
@@ -682,7 +876,11 @@ app.post("/send", authMiddleware, async (req, res) => {
           mediaFileName: fileName || "documento.pdf",
         },
       );
-      return res.json({ success: true, message: "Archivo enviado" });
+      return res.json({
+        success: true,
+        message: "Archivo enviado",
+        whatsappMessageId: sentMessage?.key?.id || null,
+      });
     }
 
     return res.status(400).json({ error: "Acción no soportada" });
@@ -690,16 +888,16 @@ app.post("/send", authMiddleware, async (req, res) => {
     console.error("Error enviando mensaje:", error);
     return res
       .status(500)
-      .json({ error: error instanceof Error ? error.message : "Error interno enviando el mensaje" });
+      .json({
+        error: error instanceof Error ? error.message : "Error interno enviando el mensaje",
+      });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`Servidor Express escuchando en el puerto ${PORT}`);
   console.log(`Base de datos SQLite: ${DATABASE_PATH}`);
-  console.log(
-    `Respaldos SQLite: ${BACKUP_DIR} (se conservan ${BACKUP_RETENTION_COUNT})`,
-  );
+  console.log(`Respaldos SQLite: ${BACKUP_DIR} (se conservan ${BACKUP_RETENTION_COUNT})`);
   console.log(
     INCOMING_WEBHOOK_URL
       ? `Webhook de mensajes entrantes: ${INCOMING_WEBHOOK_URL}`
