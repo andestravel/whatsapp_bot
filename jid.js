@@ -5,7 +5,10 @@ export function isPhoneJid(value) {
 export function normalizePhoneJid(value) {
   if (!value) return "";
   const jid = String(value).trim();
-  if (isPhoneJid(jid)) return jid;
+  if (isPhoneJid(jid)) {
+    const user = jid.split("@", 1)[0].split(":", 1)[0].replace(/\D/g, "");
+    return user ? `${user}@s.whatsapp.net` : "";
+  }
   const digits = jid.replace(/\D/g, "");
   return digits ? `${digits}@s.whatsapp.net` : "";
 }
@@ -23,6 +26,7 @@ export function extractLidPhoneMapping(value) {
 
 export async function resolveMessageJid(key, lidMapping) {
   const rawJid = String(key?.remoteJid || "").trim();
+  if (isPhoneJid(rawJid)) return normalizePhoneJid(rawJid);
   if (!rawJid.endsWith("@lid")) return rawJid;
 
   const directPhoneJid = [
@@ -31,7 +35,7 @@ export async function resolveMessageJid(key, lidMapping) {
     key?.senderPn,
     key?.participantAlt,
   ].find(isPhoneJid);
-  if (directPhoneJid) return directPhoneJid;
+  if (directPhoneJid) return normalizePhoneJid(directPhoneJid);
 
   if (typeof lidMapping?.getPNForLID !== "function") return rawJid;
 
@@ -43,9 +47,9 @@ export async function resolveMessageJid(key, lidMapping) {
 }
 
 export function resolveSenderJid(key, fallbackJid) {
-  return (
+  const sender =
     [key?.participantPn, key?.senderPn, key?.participantAlt, key?.participant].find(
       (value) => typeof value === "string" && value.trim(),
-    ) || fallbackJid
-  );
+    ) || fallbackJid;
+  return isPhoneJid(sender) ? normalizePhoneJid(sender) : sender;
 }

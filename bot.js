@@ -128,8 +128,14 @@ function isoNow() {
 function phoneFromJid(jid) {
   if (!jid || jid.endsWith("@g.us") || jid.endsWith("@broadcast")) return null;
 
-  const number = jid.split("@")[0].replace(/\D/g, "");
+  const number = jid.split("@", 1)[0].split(":", 1)[0].replace(/\D/g, "");
   return number || null;
+}
+
+function barePhoneJid(jid) {
+  if (!jid?.endsWith("@s.whatsapp.net")) return jid;
+  const number = phoneFromJid(jid);
+  return number ? `${number}@s.whatsapp.net` : jid;
 }
 
 function rememberJidAlias(aliasJid, canonicalJid) {
@@ -154,8 +160,11 @@ function canonicalJidForAlias(jid) {
 }
 
 function migrateConversationJid(aliasJid, canonicalJid) {
+  const isDeviceJid =
+    aliasJid?.endsWith("@s.whatsapp.net") && barePhoneJid(aliasJid) !== aliasJid;
+  const isLid = aliasJid?.endsWith("@lid");
   if (
-    !aliasJid?.endsWith("@lid") ||
+    (!isLid && !isDeviceJid) ||
     !canonicalJid?.endsWith("@s.whatsapp.net") ||
     aliasJid === canonicalJid
   ) {
@@ -473,6 +482,7 @@ function normalizeJid(phoneOrJid) {
   const value = String(phoneOrJid || "").trim();
   if (!value) return "";
 
+  if (value.endsWith("@s.whatsapp.net")) return barePhoneJid(value);
   if (value.includes("@")) return value;
 
   const digits = value.replace(/\D/g, "");
@@ -740,6 +750,14 @@ app.get("/status", authMiddleware, (req, res) => {
 
 // Lista de conversaciones para que la web pueda construir una bandeja de entrada.
 app.get("/conversations", authMiddleware, async (req, res) => {
+  const storedConversations = database.prepare("SELECT jid FROM conversations").all();
+  for (const conversation of storedConversations) {
+    const canonicalJid = barePhoneJid(conversation.jid);
+    if (canonicalJid !== conversation.jid) {
+      migrateConversationJid(conversation.jid, canonicalJid);
+    }
+  }
+
   const limit = parseLimit(req.query.limit);
   const initialConversations = database
     .prepare(
