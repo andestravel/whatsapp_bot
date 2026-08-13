@@ -10,6 +10,7 @@ import {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadContentFromMessage,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import QRCode from "qrcode";
@@ -32,6 +33,25 @@ const BACKUP_RETENTION_COUNT = readPositiveInteger(process.env.BACKUP_RETENTION_
 // El bot sigue funcionando aunque no exista webhook todavía.
 const INCOMING_WEBHOOK_URL = (process.env.INCOMING_WEBHOOK_URL || "").trim();
 const INCOMING_WEBHOOK_TOKEN = (process.env.INCOMING_WEBHOOK_TOKEN || "").trim();
+
+// Los archivos recibidos se suben a un bucket privado; nunca se guardan en la
+// VPS ni dentro de SQLite. El service role solo debe existir en este bot.
+const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "")
+  .trim()
+  .replace(/\/+$/, "");
+const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+const WHATSAPP_MEDIA_BUCKET = (process.env.WHATSAPP_MEDIA_BUCKET || "whatsapp-media").trim();
+const WHATSAPP_MEDIA_MAX_BYTES = readPositiveInteger(
+  process.env.WHATSAPP_MEDIA_MAX_BYTES,
+  15 * 1024 * 1024,
+);
+const WHATSAPP_MEDIA_SIGNED_URL_TTL = readPositiveInteger(
+  process.env.WHATSAPP_MEDIA_SIGNED_URL_TTL,
+  60 * 60 * 24 * 30,
+);
+const MEDIA_STORAGE_ENABLED = Boolean(
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && WHATSAPP_MEDIA_BUCKET,
+);
 
 if (!API_TOKEN) {
   console.error("Falta API_TOKEN. El bot no se iniciará sin un token seguro.");
@@ -82,6 +102,8 @@ database.exec(`
     media_mime_type TEXT,
     media_file_name TEXT,
     media_size_bytes INTEGER,
+    media_storage_path TEXT,
+    media_url TEXT,
     message_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     FOREIGN KEY (jid) REFERENCES conversations(jid)
@@ -108,6 +130,8 @@ database.exec(`
 ensureColumn("messages", "media_mime_type", "TEXT");
 ensureColumn("messages", "media_file_name", "TEXT");
 ensureColumn("messages", "media_size_bytes", "INTEGER");
+ensureColumn("messages", "media_storage_path", "TEXT");
+ensureColumn("messages", "media_url", "TEXT");
 
 function readPositiveInteger(value, fallback) {
   const parsed = Number.parseInt(String(value || ""), 10);
@@ -123,6 +147,120 @@ function ensureColumn(tableName, columnName, definition) {
 
 function isoNow() {
   return new Date().toISOString();
+}
+
+function encodeStoragePath(storagePath) {
+  return storagePath.split("/").map(encodeURIComponent).join("/");
+}
+
+function storageObjectEndpoint(storagePath) {
+  return `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(WHATSAPP_MEDIA_BUCKET)}/${encodeStoragePath(storagePath)}`;
+}
+
+function storageSignEndpoint(storagePath) {
+  return `${SUPABASE_URL}/storage/v1/object/sign/${encodeURIComponent(WHATSAPP_MEDIA_BUCKET)}/${encodeStoragePath(storagePath)}`;
+}
+
+function storageHeaders(extra = {}) {
+  return {
+    Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    ...extra,
+  };
+}
+
+async function createMediaSignedUrl(storagePath) {
+  if (!MEDIA_STORAGE_ENABLED || !storagePath) return null;
+
+  const response = await fetch(storageSignEndpoint(storagePath), {
+    method: "POST",
+    headers: storageHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ expiresIn: WHATSAPP_MEDIA_SIGNED_URL_TTL }),
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || typeof payload?.signedURL !== "string") {
+    throw new Error(
+      `Supabase Storage no generó URL firmada (${response.status}): ${
+        payload?.message || payload?.error || "respuesta inválida"
+      }`,
+    );
+  }
+
+  return payload.signedURL.startsWith("http")
+    ? payload.signedURL
+    : `${SUPABASE_URL}/storage/v1${payload.signedURL}`;
+}
+
+function safeStoragePart(value, fallback = "unknown") {
+  const safe = String(value || "")
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 120);
+  return safe || fallback;
+}
+
+function mediaExtension(mediaMimeType, mediaFileName) {
+  const originalExtension = path.extname(String(mediaFileName || "")).toLowerCase();
+  if (/^\.[a-z0-9]{1,10}$/.test(originalExtension)) return originalExtension.slice(1);
+
+  const extensions = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "text/plain": "txt",
+    "audio/ogg": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "video/mp4": "mp4",
+    "video/3gpp": "3gp",
+  };
+
+  return extensions[String(mediaMimeType || "").toLowerCase()] || "bin";
+}
+
+async function uploadMediaBuffer({ buffer, mimeType, fileName, jid, messageId }) {
+  if (!MEDIA_STORAGE_ENABLED) return null;
+
+  const phone = safeStoragePart(phoneFromJid(jid));
+  const safeMessageId = safeStoragePart(messageId, randomUUID());
+  const extension = mediaExtension(mimeType, fileName);
+  const storagePath = `incoming/${phone}/${safeMessageId}.${extension}`;
+  const response = await fetch(storageObjectEndpoint(storagePath), {
+    method: "POST",
+    headers: storageHeaders({
+      "Content-Type": mimeType || "application/octet-stream",
+      "Cache-Control": "private, max-age=3600",
+      "x-upsert": "false",
+    }),
+    body: buffer,
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(
+      `Supabase Storage no guardó el archivo (${response.status}): ${
+        payload?.message || payload?.error || "respuesta inválida"
+      }`,
+    );
+  }
+
+  let signedUrl = null;
+  try {
+    signedUrl = await createMediaSignedUrl(storagePath);
+  } catch (error) {
+    console.warn(
+      `[MEDIA] Archivo subido, pero no se pudo firmar ${storagePath}:`,
+      error instanceof Error ? error.message : error,
+    );
+  }
+
+  return { storagePath, signedUrl };
 }
 
 function phoneFromJid(jid) {
@@ -304,6 +442,8 @@ function saveMessage({
   mediaMimeType,
   mediaFileName,
   mediaSizeBytes,
+  mediaStoragePath,
+  mediaUrl,
   messageAt,
 }) {
   upsertConversation({
@@ -328,10 +468,12 @@ function saveMessage({
         media_mime_type,
         media_file_name,
         media_size_bytes,
+        media_storage_path,
+        media_url,
         message_at,
         created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     )
     .run(
@@ -345,6 +487,8 @@ function saveMessage({
       mediaMimeType || null,
       mediaFileName || null,
       mediaSizeBytes || null,
+      mediaStoragePath || null,
+      mediaUrl || null,
       messageAt,
       isoNow(),
     );
@@ -431,18 +575,31 @@ function unwrapMessageContent(content) {
   return current || {};
 }
 
+function getMediaDescriptor(message) {
+  const content = unwrapMessageContent(message?.message);
+  const mediaTypes = [
+    ["imageMessage", "image"],
+    ["videoMessage", "video"],
+    ["documentMessage", "document"],
+    ["audioMessage", "audio"],
+    ["stickerMessage", "sticker"],
+  ];
+
+  for (const [messageType, downloadType] of mediaTypes) {
+    if (content[messageType]) {
+      return { content: content[messageType], messageType, downloadType };
+    }
+  }
+
+  return null;
+}
+
 function extractMessageData(message) {
   const content = unwrapMessageContent(message?.message);
   const messageType = Object.keys(content)[0] || "unknown";
-  const media =
-    content.imageMessage ||
-    content.videoMessage ||
-    content.documentMessage ||
-    content.audioMessage ||
-    content.stickerMessage ||
-    null;
+  const media = getMediaDescriptor(message)?.content || null;
 
-  const messageText =
+  let messageText =
     content.conversation ||
     content.extendedTextMessage?.text ||
     content.imageMessage?.caption ||
@@ -453,6 +610,45 @@ function extractMessageData(message) {
     content.templateButtonReplyMessage?.selectedDisplayText ||
     null;
 
+  if (!String(messageText || "").trim()) {
+    const fallbackByType = {
+      reactionMessage: content.reactionMessage?.text
+        ? `Reacción: ${content.reactionMessage.text}`
+        : "Reacción",
+      contactMessage: content.contactMessage?.displayName
+        ? `Contacto compartido: ${content.contactMessage.displayName}`
+        : "Contacto compartido",
+      contactsArrayMessage: "Contactos compartidos",
+      locationMessage: "Ubicación compartida",
+      liveLocationMessage: "Ubicación en vivo compartida",
+      stickerMessage: "Sticker recibido",
+      audioMessage: content.audioMessage?.ptt ? "Nota de voz recibida" : "Audio recibido",
+      pollCreationMessage: "Encuesta recibida",
+      pollCreationMessageV3: "Encuesta recibida",
+      pollUpdateMessage: "Respuesta a encuesta",
+      productMessage: "Producto recibido",
+      orderMessage: "Pedido recibido",
+      buttonsResponseMessage: "Respuesta de botones recibida",
+      listResponseMessage: "Respuesta de lista recibida",
+      templateButtonReplyMessage: "Respuesta de plantilla recibida",
+    };
+
+    const mediaFallbackByType = {
+      imageMessage: "Imagen recibida",
+      videoMessage: "Video recibido",
+      documentMessage: media?.fileName
+        ? `Documento recibido: ${media.fileName}`
+        : "Documento recibido",
+      audioMessage: content.audioMessage?.ptt ? "Nota de voz recibida" : "Audio recibido",
+      stickerMessage: "Sticker recibido",
+    };
+
+    messageText =
+      fallbackByType[messageType] ||
+      mediaFallbackByType[messageType] ||
+      `[Mensaje ${messageType}]`;
+  }
+
   return {
     messageType,
     messageText: typeof messageText === "string" ? messageText.trim() : null,
@@ -461,6 +657,52 @@ function extractMessageData(message) {
     mediaFileName: media?.fileName || null,
     mediaSizeBytes: protobufNumber(media?.fileLength),
   };
+}
+
+async function downloadAndStoreMessageMedia(message, { jid, messageId, mimeType, fileName }) {
+  if (!MEDIA_STORAGE_ENABLED) return null;
+
+  const descriptor = getMediaDescriptor(message);
+  if (!descriptor) return null;
+
+  const declaredSize = protobufNumber(descriptor.content?.fileLength);
+  if (declaredSize && declaredSize > WHATSAPP_MEDIA_MAX_BYTES) {
+    throw new Error(
+      `Archivo rechazado por tamaño (${declaredSize} bytes; máximo ${WHATSAPP_MEDIA_MAX_BYTES})`,
+    );
+  }
+
+  const stream = await downloadContentFromMessage(descriptor.content, descriptor.downloadType);
+  const chunks = [];
+  let totalBytes = 0;
+
+  for await (const chunk of stream) {
+    const bufferChunk = Buffer.from(chunk);
+    totalBytes += bufferChunk.length;
+    if (totalBytes > WHATSAPP_MEDIA_MAX_BYTES) {
+      throw new Error(
+        `Archivo rechazado por tamaño (${totalBytes} bytes; máximo ${WHATSAPP_MEDIA_MAX_BYTES})`,
+      );
+    }
+    chunks.push(bufferChunk);
+  }
+
+  const buffer = Buffer.concat(chunks);
+  const stored = await uploadMediaBuffer({
+    buffer,
+    mimeType,
+    fileName,
+    jid,
+    messageId,
+  });
+
+  return stored
+    ? {
+        mediaStoragePath: stored.storagePath,
+        mediaUrl: stored.signedUrl,
+        mediaSizeBytes: totalBytes,
+      }
+    : null;
 }
 
 function protobufNumber(value) {
@@ -630,7 +872,8 @@ async function connectToWhatsApp() {
     }
   });
 
-  // Guardar y reenviar los mensajes recibidos.
+  // Guardar y reenviar los mensajes recibidos, incluidos los enviados desde
+  // el teléfono vinculado. Los mensajes internos de Signal no son chats.
   sock.ev.on("messages.upsert", async (event) => {
     if (event.type !== "notify") return;
 
@@ -638,8 +881,21 @@ async function connectToWhatsApp() {
       try {
         const rawJid = message?.key?.remoteJid || "";
 
-        // No procesar mensajes propios ni mensajes de estado de WhatsApp.
-        if (!rawJid || message.key?.fromMe || rawJid === "status@broadcast") continue;
+        // No procesar mensajes de estado de WhatsApp.
+        if (!rawJid || rawJid === "status@broadcast") continue;
+
+        // El evento fromMe de un mensaje enviado desde el CRM puede llegar
+        // después de sendAndStore(). No lo descargamos ni lo guardamos otra vez.
+        if (
+          message.key?.id &&
+          database
+            .prepare("SELECT 1 FROM messages WHERE whatsapp_message_id = ? LIMIT 1")
+            .get(message.key.id)
+        ) {
+          continue;
+        }
+
+        const isFromMe = Boolean(message.key?.fromMe);
 
         const resolvedJid = await resolveMessageJid(
           message.key,
@@ -651,21 +907,50 @@ async function connectToWhatsApp() {
 
         const { messageType, messageText, mediaMimeType, mediaFileName, mediaSizeBytes } =
           extractMessageData(message);
+
+        // Estos eventos son metadatos internos de WhatsApp/Signal, no mensajes
+        // de clientes ni del vendedor.
+        if (messageType === "protocolMessage" || messageType === "senderKeyDistributionMessage") {
+          continue;
+        }
+
         const messageAt = messageTimestampToIso(message.messageTimestamp);
-        const whatsappMessageId = message.key?.id || `incoming-${randomUUID()}`;
+        const whatsappMessageId =
+          message.key?.id || `${isFromMe ? "outgoing" : "incoming"}-${randomUUID()}`;
+
+        let mediaReference = null;
+        if (getMediaDescriptor(message)) {
+          try {
+            mediaReference = await downloadAndStoreMessageMedia(message, {
+              jid,
+              messageId: whatsappMessageId,
+              mimeType: mediaMimeType,
+              fileName: mediaFileName,
+            });
+          } catch (error) {
+            // El mensaje y sus metadatos siguen quedando registrados aunque el
+            // archivo falle. Así nunca se pierde el contexto de la conversación.
+            console.error(
+              `[MEDIA] No se pudo guardar ${whatsappMessageId}:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
 
         const record = {
           whatsappMessageId,
           jid,
           phone: phoneFromJid(jid),
-          senderJid,
-          senderName: message.pushName || null,
-          direction: "incoming",
+          senderJid: isFromMe ? null : senderJid,
+          senderName: isFromMe ? null : message.pushName || null,
+          direction: isFromMe ? "outgoing" : "incoming",
           messageType,
           messageText,
           mediaMimeType,
           mediaFileName,
           mediaSizeBytes,
+          mediaStoragePath: mediaReference?.mediaStoragePath || null,
+          mediaUrl: mediaReference?.mediaUrl || null,
           messageAt,
         };
 
@@ -673,12 +958,14 @@ async function connectToWhatsApp() {
         if (!wasSaved) continue;
 
         console.log(
-          `[INCOMING] ${record.phone || record.jid}: ${record.messageText || `[${record.messageType}]`}`,
+          `[${isFromMe ? "OUTGOING-PHONE" : "INCOMING"}] ${record.phone || record.jid}: ${record.messageText}`,
         );
 
-        await forwardIncomingMessage(record);
+        // Solo los mensajes de clientes disparan el webhook. Los enviados
+        // desde el teléfono quedan en SQLite y aparecen en el historial local.
+        if (!isFromMe) await forwardIncomingMessage(record);
       } catch (error) {
-        console.error("Error procesando mensaje entrante:", error);
+        console.error("Error procesando mensaje de WhatsApp:", error);
       }
     }
   });
@@ -721,6 +1008,8 @@ function sendAndStore(jid, content, details) {
         mediaMimeType: details.mediaMimeType,
         mediaFileName: details.mediaFileName,
         mediaSizeBytes: details.mediaSizeBytes,
+        mediaStoragePath: details.mediaStoragePath,
+        mediaUrl: details.mediaUrl,
         messageAt: isoNow(),
       });
     } catch (error) {
@@ -812,7 +1101,7 @@ app.post("/conversations/link", authMiddleware, (req, res) => {
 });
 
 // Historial de una conversación. El JID debe enviarse URL-encoded.
-app.get("/conversations/:jid/messages", authMiddleware, (req, res) => {
+app.get("/conversations/:jid/messages", authMiddleware, async (req, res) => {
   const jid = decodeURIComponent(req.params.jid);
   const limit = parseLimit(req.query.limit);
 
@@ -829,7 +1118,26 @@ app.get("/conversations/:jid/messages", authMiddleware, (req, res) => {
     .all(jid, limit)
     .reverse();
 
-  res.json({ jid, messages });
+  const hydratedMessages = await Promise.all(
+    messages.map(async (message) => {
+      if (!message.media_storage_path || !MEDIA_STORAGE_ENABLED) return message;
+
+      try {
+        return {
+          ...message,
+          media_url: await createMediaSignedUrl(message.media_storage_path),
+        };
+      } catch (error) {
+        console.warn(
+          `[MEDIA] No se pudo renovar la URL de ${message.whatsapp_message_id}:`,
+          error instanceof Error ? error.message : error,
+        );
+        return message;
+      }
+    }),
+  );
+
+  res.json({ jid, messages: hydratedMessages });
 });
 
 app.post("/send", authMiddleware, async (req, res) => {
@@ -867,6 +1175,7 @@ app.post("/send", authMiddleware, async (req, res) => {
           messageType: "imageMessage",
           messageText: caption || null,
           mediaMimeType: "image/remote",
+          mediaUrl: url,
         },
       );
       return res.json({
@@ -892,6 +1201,7 @@ app.post("/send", authMiddleware, async (req, res) => {
           messageText: caption || null,
           mediaMimeType: "application/pdf",
           mediaFileName: fileName || "documento.pdf",
+          mediaUrl: url,
         },
       );
       return res.json({
@@ -920,5 +1230,10 @@ app.listen(PORT, () => {
     INCOMING_WEBHOOK_URL
       ? `Webhook de mensajes entrantes: ${INCOMING_WEBHOOK_URL}`
       : "Webhook de mensajes entrantes: no configurado todavía",
+  );
+  console.log(
+    MEDIA_STORAGE_ENABLED
+      ? `Storage multimedia: ${WHATSAPP_MEDIA_BUCKET} (máximo ${WHATSAPP_MEDIA_MAX_BYTES} bytes)`
+      : "Storage multimedia: no configurado; los archivos no se conservarán",
   );
 });
