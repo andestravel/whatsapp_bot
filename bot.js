@@ -123,6 +123,12 @@ database.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_jid_aliases_canonical
     ON jid_aliases (canonical_jid);
+
+  CREATE TABLE IF NOT EXISTS conversation_reads (
+    jid TEXT PRIMARY KEY,
+    read_at TEXT NOT NULL,
+    read_by TEXT
+  );
 `);
 
 // Estas migraciones pequeñas permiten actualizar una base creada por una versión
@@ -365,6 +371,26 @@ function migrateConversationJid(aliasJid, canonicalJid) {
     }
 
     database.prepare("UPDATE messages SET jid = ? WHERE jid = ?").run(canonicalJid, aliasJid);
+    const sourceRead = database
+      .prepare("SELECT read_at, read_by FROM conversation_reads WHERE jid = ?")
+      .get(aliasJid);
+    const targetRead = database
+      .prepare("SELECT read_at FROM conversation_reads WHERE jid = ?")
+      .get(canonicalJid);
+    if (sourceRead && (!targetRead || sourceRead.read_at > targetRead.read_at)) {
+      database
+        .prepare(
+          `
+          INSERT INTO conversation_reads (jid, read_at, read_by)
+          VALUES (?, ?, ?)
+          ON CONFLICT(jid) DO UPDATE SET
+            read_at = excluded.read_at,
+            read_by = excluded.read_by
+        `,
+        )
+        .run(canonicalJid, sourceRead.read_at, sourceRead.read_by || null);
+    }
+    database.prepare("DELETE FROM conversation_reads WHERE jid = ?").run(aliasJid);
     rememberJidAlias(aliasJid, canonicalJid);
     database.prepare("DELETE FROM conversations WHERE jid = ?").run(aliasJid);
     database.exec("COMMIT");
@@ -1102,7 +1128,18 @@ app.get("/conversations", authMiddleware, async (req, res) => {
           WHERE m.jid = c.jid
           ORDER BY m.message_at DESC
           LIMIT 1
-        ) AS last_message_recorded_at
+        ) AS last_message_recorded_at,
+        (
+          SELECT COUNT(*)
+          FROM messages m
+          WHERE m.jid = c.jid
+            AND m.direction = 'incoming'
+            AND m.message_at >= COALESCE(
+              (SELECT r.read_at FROM conversation_reads r WHERE r.jid = c.jid),
+              c.last_message_at,
+              '1970-01-01T00:00:00.000Z'
+            )
+        ) AS unread_count
       FROM conversations c
       ORDER BY c.updated_at DESC
       LIMIT ?
@@ -1128,6 +1165,35 @@ app.post("/conversations/link", authMiddleware, (req, res) => {
 
   migrateConversationJid(aliasJid, canonicalJid);
   return res.json({ success: true, jid: canonicalJid });
+});
+
+app.post("/conversations/:jid/read", authMiddleware, (req, res) => {
+  const requestedJid = decodeURIComponent(req.params.jid);
+  const jid = canonicalJidForAlias(requestedJid);
+  if (!jid) return res.status(400).json({ error: "JID requerido" });
+
+  const requestedReadAt = String(req.body?.readAt || "").trim();
+  const readAt = Number.isFinite(new Date(requestedReadAt).getTime())
+    ? requestedReadAt
+    : isoNow();
+  const readBy = String(req.body?.readBy || "").trim() || null;
+
+  database
+    .prepare(
+      `
+      INSERT INTO conversation_reads (jid, read_at, read_by)
+      VALUES (?, ?, ?)
+      ON CONFLICT(jid) DO UPDATE SET
+        read_at = MAX(conversation_reads.read_at, excluded.read_at),
+        read_by = CASE
+          WHEN excluded.read_at >= conversation_reads.read_at THEN excluded.read_by
+          ELSE conversation_reads.read_by
+        END
+    `,
+    )
+    .run(jid, readAt, readBy);
+
+  return res.json({ success: true, jid, readAt });
 });
 
 // Historial de una conversación. El JID debe enviarse URL-encoded.
