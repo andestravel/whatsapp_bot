@@ -1073,16 +1073,46 @@ app.get("/conversations", authMiddleware, async (req, res) => {
   const conversations = database
     .prepare(
       `
-      SELECT *
-      FROM conversations
-      ORDER BY updated_at DESC
+      SELECT
+        c.*,
+        (
+          SELECT m.direction
+          FROM messages m
+          WHERE m.jid = c.jid
+          ORDER BY m.message_at DESC
+          LIMIT 1
+        ) AS last_message_direction,
+        (
+          SELECT m.sender_jid
+          FROM messages m
+          WHERE m.jid = c.jid
+          ORDER BY m.message_at DESC
+          LIMIT 1
+        ) AS last_message_sender_jid,
+        (
+          SELECT m.sender_name
+          FROM messages m
+          WHERE m.jid = c.jid
+          ORDER BY m.message_at DESC
+          LIMIT 1
+        ) AS last_message_sender_name,
+        (
+          SELECT m.message_at
+          FROM messages m
+          WHERE m.jid = c.jid
+          ORDER BY m.message_at DESC
+          LIMIT 1
+        ) AS last_message_recorded_at
+      FROM conversations c
+      ORDER BY c.updated_at DESC
       LIMIT ?
-    `,
+      `,
     )
     .all(limit)
     .map((conversation) => ({
       ...conversation,
       alias_jids: aliasesForJid(conversation.jid),
+      last_message_at: conversation.last_message_recorded_at || conversation.last_message_at,
     }));
 
   res.json({ conversations });
